@@ -1,0 +1,95 @@
+# Builds Deriva from the PRIVATE source repo (mordf0kas/deriva) and publishes the macOS installer here.
+# Runs in this public repo because Actions minutes are free for public repos; the source is fetched
+# with a read-only deploy key (secret DERIVA_SRC_KEY) and never stored here. Only the installer
+# ends up public, in the release. The Windows installer is built locally with Inno Setup.
+# Run it by hand: Actions -> build -> Run workflow.
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch / tag / commit of mordf0kas/deriva to build"
+        default: main
+      publish:
+        description: "Upload the installer to release v<version> here (version from CMakeLists.txt)"
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Fetch the source (private repo, read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: mordf0kas/deriva
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.DERIVA_SRC_KEY }}
+          persist-credentials: false
+      - name: Fetch JUCE 8.0.4
+        run: git clone --depth 1 --branch 8.0.4 https://github.com/juce-framework/JUCE.git JUCE
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DJUCE_DIR="$PWD/JUCE" -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+      - name: Offline check
+        run: |
+          cmake --build build --config Release --target DerivaCheck --parallel 4
+          if [ -f build/DerivaCheck_artefacts/Release/DerivaCheck ]; then build/DerivaCheck_artefacts/Release/DerivaCheck; else build/DerivaCheck_artefacts/DerivaCheck; fi
+      - name: Build VST3, AU and Standalone
+        run: |
+          cmake --build build --config Release --target Deriva_VST3 --parallel 4
+          cmake --build build --config Release --target Deriva_AU --parallel 4
+          cmake --build build --config Release --target Deriva_Standalone --parallel 4
+      - name: Package macOS installer (.pkg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^project(DERIVA VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          R="build/Deriva_artefacts/Release"
+          ls -R "$R" | head -40
+          # JUCE writes moduleinfo.json after the linker's ad-hoc signature: re-seal the final bundles
+          for b in "$R/VST3/Deriva.vst3" "$R/AU/Deriva.component" "$R/Standalone/Deriva.app"; do
+            codesign --force --deep --sign - "$b"
+            codesign --verify --deep --strict -vv "$b"
+          done
+          mkdir -p pkg_root/Library/Audio/Plug-Ins/VST3 pkg_root/Library/Audio/Plug-Ins/Components pkg_root/Applications pkg_scripts out
+          cp -R "$R/VST3/Deriva.vst3" pkg_root/Library/Audio/Plug-Ins/VST3/
+          cp -R "$R/AU/Deriva.component" pkg_root/Library/Audio/Plug-Ins/Components/
+          cp -R "$R/Standalone/Deriva.app" pkg_root/Applications/
+          printf '#!/bin/bash\nxattr -dr com.apple.quarantine "/Library/Audio/Plug-Ins/VST3/Deriva.vst3" "/Library/Audio/Plug-Ins/Components/Deriva.component" "/Applications/Deriva.app" 2>/dev/null || true\nexit 0\n' > pkg_scripts/postinstall
+          chmod +x pkg_scripts/postinstall
+          # non-relocatable bundles, so Installer always writes to the system folders
+          pkgbuild --analyze --root pkg_root components.plist
+          i=0; while plutil -extract "$i" xml1 -o /dev/null components.plist 2>/dev/null; do plutil -replace "$i.BundleIsRelocatable" -bool NO components.plist; i=$((i+1)); done
+          pkgbuild --root pkg_root --component-plist components.plist --scripts pkg_scripts --identifier "com.drelvaaudio.deriva.installer" --version "$VERSION" --install-location / component.pkg
+          productbuild --package component.pkg "out/Deriva-v1.0-beta-macOS.pkg"
+          echo "$VERSION" > out/VERSION
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Deriva-macos
+          path: out
+
+  release:
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the release
+        run: |
+          VERSION=$(tr -d '\r\n' < dist/VERSION); TAG="v$VERSION"
+          FILES=(); for f in dist/Deriva-v*; do [ -s "$f" ] && FILES+=("$f"); done
+          [ ${#FILES[@]} -gt 0 ] || { echo "::error::nothing to upload"; exit 1; }
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+          else
+            gh release create "$TAG" "${FILES[@]}" --title "Deriva $TAG" --notes "Deriva $TAG"
+          fi
+          printf 'Uploaded to %s:\n%s\n' "$TAG" "$(ls dist)" >> "$GITHUB_STEP_SUMMARY"
